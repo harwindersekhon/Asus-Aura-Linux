@@ -1,0 +1,10 @@
+# ASUS AURA LED Controller - allow the local user to drive the ARGB headers.
+# uaccess covers the logged-in seat; group wheel is the fallback for
+# non-seat contexts (ssh, systemd services).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1867", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1872", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1889", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="18a3", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="18f3", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1939", TAG+="uaccess", GROUP="wheel", MODE="0660"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="19af", TAG+="uaccess", GROUP="wheel", MODE="0660"

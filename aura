@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""
+aura - control ASUS AURA lighting (AIO pump head, fans, case strips) on ASUS
+       boards that expose the USB "AURA LED Controller" (0b05:19af & friends).
+
+Zero dependencies: speaks the vendor HID protocol straight to /dev/hidraw*.
+
+  aura info                      # firmware + channel config (read-only probe)
+  aura static red                # solid colour
+  aura static '#00ffcc'
+  aura effect breathing blue     # animated; runs until Ctrl-C
+  aura off
+  aura pulse cyan
+
+Everything is driven through the controller's direct mode. Its built-in effect
+engine is deliberately unused: on this hardware selecting any built-in mode
+takes the channel away from the host and renders nothing. That also means the
+colour lives in volatile state - it is lost on power-off, not saved to flash.
+"""
+
+import argparse
+import glob
+import os
+import random
+import re
+import select
+import sys
+import time
+
+AURA_VENDOR = 0x0B05
+AURA_PRODUCTS = {0x1867, 0x1872, 0x1889, 0x18A3, 0x18F3, 0x1939, 0x19AF}
+
+REPORT_ID = 0xEC
+PACKET_LEN = 65                 # 1 report-ID byte + 64 payload bytes
+LEDS_PER_PACKET = 20            # (65 - 5 header bytes) / 3 bytes per LED
+
+# Opcode, always byte 1 of a packet.
+OP_EFFECT = 0x35                # choose a built-in effect for a channel
+OP_COLOR = 0x36                 # load the colour that effect should use
+OP_DIRECT = 0x40                # stream raw per-LED colours
+OP_COMMIT = 0x3F                # persist current settings to controller flash
+OP_FIRMWARE = 0x82
+OP_CONFIG = 0xB0
+
+DIRECT_APPLY = 0x80             # OR'd into the channel byte of the final packet
+COLOR_FIXED = 0xFF              # offset 3 of OP_COLOR: paint the whole channel
+MODE_DIRECT = 0xFF              # the effect id that hands control to the host
+
+FALLBACK_CHANNELS = 3           # if the controller won't tell us
+FALLBACK_LEDS = 120
+
+# This controller's built-in effect engine does not render while the host has
+# the device: any OP_EFFECT mode other than MODE_DIRECT just drops the channel
+# out of direct mode and goes dark. So every effect below is animated here and
+# streamed as direct frames. ANIMATED effects run until Ctrl-C.
+STILL_EFFECTS = ("static", "off")
+ANIMATED_EFFECTS = ("breathing", "flashing", "cycle", "rainbow", "chase",
+                    "flicker")
+EFFECTS = STILL_EFFECTS + ANIMATED_EFFECTS
+
+COLORS = {
+    "off": (0, 0, 0), "black": (0, 0, 0), "white": (255, 255, 255),
+    "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
+    "orange": (255, 64, 0), "purple": (128, 0, 255), "pink": (255, 32, 96),
+}
+
+
+def parse_color(text):
+    key = text.strip().lower()
+    if key in COLORS:
+        return COLORS[key]
+    hexish = key[1:] if key.startswith("#") else key
+    if re.fullmatch(r"[0-9a-f]{6}", hexish):
+        return tuple(int(hexish[i:i + 2], 16) for i in (0, 2, 4))
+    if "," in key:
+        parts = [p.strip() for p in key.split(",")]
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            vals = tuple(int(p) for p in parts)
+            if all(0 <= v <= 255 for v in vals):
+                return vals
+    raise argparse.ArgumentTypeError(
+        f"bad colour {text!r}; use a name ({', '.join(sorted(COLORS))}), "
+        "#rrggbb, or r,g,b")
+
+
+def find_device():
+    """Return the /dev/hidraw* node belonging to the AURA controller."""
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(node, "device/uevent")) as fh:
+                uevent = fh.read()
+        except OSError:
+            continue
+        match = re.search(r"HID_ID=\w+:0*([0-9A-Fa-f]{1,8}):0*([0-9A-Fa-f]{1,8})",
+                          uevent)
+        if not match:
+            continue
+        vendor, product = int(match.group(1), 16), int(match.group(2), 16)
+        if vendor == AURA_VENDOR and product in AURA_PRODUCTS:
+            return "/dev/" + os.path.basename(node)
+    return None
+
+
+class Aura:
+    def __init__(self, path=None):
+        self.path = path or find_device()
+        if self.path is None:
+            sys.exit("no ASUS AURA LED Controller found (looked for "
+                     "0b05:19af on /dev/hidraw*)")
+        try:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        except PermissionError:
+            sys.exit(f"cannot open {self.path}: permission denied.\n"
+                     "Install the udev rule (see README) or run with sudo.")
+        self._config = None
+
+    def close(self):
+        os.close(self.fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def send(self, *payload, pace=0.004):
+        """Send one 65-byte output report: report ID, opcode, then payload."""
+        if len(payload) > PACKET_LEN - 1:
+            raise ValueError("payload too long for one report")
+        buf = bytearray(PACKET_LEN)
+        buf[0] = REPORT_ID
+        buf[1:1 + len(payload)] = bytes(payload)
+        os.write(self.fd, bytes(buf))
+        if pace:
+            time.sleep(pace)    # the controller drops packets sent back-to-back
+
+    def ask(self, *payload, timeout=1.0):
+        """Send a request and return the controller's reply, or None."""
+        self.drain()
+        self.send(*payload)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self.fd], [], [],
+                                        max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            try:
+                return os.read(self.fd, PACKET_LEN)
+            except BlockingIOError:
+                continue
+        return None
+
+    def drain(self):
+        """Discard any stale input reports so ask() reads a fresh reply."""
+        while True:
+            ready, _, _ = select.select([self.fd], [], [], 0)
+            if not ready:
+                return
+            try:
+                os.read(self.fd, PACKET_LEN)
+            except (BlockingIOError, OSError):
+                return
+
+    # -- queries -----------------------------------------------------------
+    def firmware(self):
+        reply = self.ask(OP_FIRMWARE)
+        if not reply:
+            return None
+        text = bytes(reply[2:18]).split(b"\x00")[0]
+        return text.decode("ascii", "replace").strip()
+
+    def config(self):
+        if self._config is None:
+            reply = self.ask(OP_CONFIG)
+            self._config = bytes(reply[4:]) if reply else b""
+        return self._config
+
+    def channel_count(self):
+        """How many addressable headers this board actually has.
+
+        Offset 0x02 of the config table. Writing to headers past this count
+        makes the controller ignore the whole batch, so it matters.
+        """
+        table = self.config()
+        if len(table) > 0x02 and 1 <= table[0x02] <= 8:
+            return table[0x02]
+        return FALLBACK_CHANNELS
+
+    def led_count(self, channel):
+        """Max LEDs the controller will accept for a header."""
+        table = self.config()
+        offset = 0x04 + channel * 6 + 0x02
+        if len(table) > offset and table[offset]:
+            return table[offset]
+        return FALLBACK_LEDS
+
+    # -- writes ------------------------------------------------------------
+    def set_effect(self, channel, effect):
+        """Select a built-in effect. The mode byte sits at offset 5, after two
+        reserved zero bytes - not immediately after the channel."""
+        self.send(OP_EFFECT, channel, 0x00, 0x00, effect)
+
+    def set_color(self, channel, rgb):
+        """Load the colour the built-in effect renders with.
+
+        Offset 3 is the "fixed" flag: 0xFF paints the whole channel with the
+        single colour that follows, which is what every effect here wants.
+        """
+        self.send(OP_COLOR, channel, COLOR_FIXED, 0x00, *rgb)
+
+    def enter_direct(self, channel):
+        """Hand the channel to the host. Without this the controller keeps
+        running its built-in effect and silently ignores direct frames."""
+        self.set_effect(channel, MODE_DIRECT)
+
+    def direct(self, channel, colors, start=0, apply_now=True):
+        """Stream explicit per-LED colours (host keeps control)."""
+        chunks = [colors[i:i + LEDS_PER_PACKET]
+                  for i in range(0, len(colors), LEDS_PER_PACKET)] or [[]]
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            # The apply flag rides in the channel byte; the count byte stays a
+            # plain count. Folding the flag into the count made every frame a
+            # no-op, because the controller read a nonsense LED count.
+            selector = channel | (DIRECT_APPLY if (last and apply_now) else 0)
+            body = [component for rgb in chunk for component in rgb]
+            self.send(OP_DIRECT, selector,
+                      start + index * LEDS_PER_PACKET, len(chunk), *body,
+                      pace=0.0015)
+
+    def commit(self):
+        """Write the current state to flash so it survives a power cycle."""
+        self.send(OP_COMMIT, 0x55, 0x00)
+
+
+def channel_list(spec, dev):
+    if spec == "all":
+        return list(range(dev.channel_count()))
+    return [int(spec)]
+
+
+def paint(dev, channels, rgb):
+    """Light every LED of each channel one colour, via direct mode."""
+    for channel in channels:
+        dev.enter_direct(channel)
+    for channel in channels:
+        dev.direct(channel, [rgb] * dev.led_count(channel))
+
+
+def cmd_info(args, dev):
+    print(f"device      {dev.path}")
+    firmware = dev.firmware()
+    print(f"firmware    {firmware if firmware else '(no reply)'}")
+    table = dev.config()
+    if table:
+        print(f"channels    {dev.channel_count()}")
+        for channel in range(dev.channel_count()):
+            print(f"  channel {channel}  up to {dev.led_count(channel)} LEDs")
+        print("config table (raw):")
+        for offset in range(0, len(table), 16):
+            row = table[offset:offset + 16]
+            hexes = " ".join(f"{b:02x}" for b in row)
+            print(f"  {offset:02x}  {hexes}")
+    else:
+        print("config table  (no reply)")
+
+
+def hsv_rgb(hue, value=1.0):
+    """hue in [0,1) -> full-saturation rgb tuple."""
+    sector, frac = divmod(hue * 6.0, 1.0)
+    sector = int(sector) % 6
+    rise, fall = frac, 1.0 - frac
+    table = ((1, rise, 0), (fall, 1, 0), (0, 1, rise),
+             (0, fall, 1), (rise, 0, 1), (1, 0, fall))
+    return tuple(int(component * value * 255) for component in table[sector])
+
+
+def frame_for(effect, color, step, leds):
+    """One frame of an animated effect, as a list of per-LED colours."""
+    if effect == "breathing":
+        level = (1 - abs((step % 60) / 30.0 - 1)) ** 2
+        return [tuple(int(c * level) for c in color)] * leds
+    if effect == "flashing":
+        on = (step // 15) % 2 == 0
+        return [color if on else (0, 0, 0)] * leds
+    if effect == "cycle":
+        return [hsv_rgb((step % 180) / 180.0)] * leds
+    if effect == "rainbow":
+        shift = (step % 120) / 120.0
+        return [hsv_rgb((shift + i / float(leds)) % 1.0) for i in range(leds)]
+    if effect == "chase":
+        head = step % leds
+        out = []
+        for i in range(leds):
+            distance = (head - i) % leds
+            level = max(0.0, 1.0 - distance / 8.0)
+            out.append(tuple(int(c * level) for c in color))
+        return out
+    if effect == "flicker":
+        return [tuple(int(c * random.uniform(0.25, 1.0)) for c in color)
+                for _ in range(leds)]
+    raise ValueError(effect)
+
+
+def animate(dev, channels, effect, color, fps=30):
+    counts = {c: dev.led_count(c) for c in channels}
+    for channel in channels:
+        dev.enter_direct(channel)
+    print(f"{effect} - Ctrl-C to stop")
+    try:
+        step = 0
+        while True:
+            for channel in channels:
+                dev.direct(channel, frame_for(effect, color, step,
+                                              counts[channel]))
+            step += 1
+            time.sleep(1.0 / fps)
+    except KeyboardInterrupt:
+        print()
+
+
+def cmd_effect(args, dev):
+    channels = channel_list(args.channel, dev)
+    color = args.color or (255, 255, 255)
+    if args.effect == "off":
+        paint(dev, channels, (0, 0, 0))
+    elif args.effect == "static":
+        paint(dev, channels, color)
+    else:
+        animate(dev, channels, args.effect, color)
+
+
+def cmd_static(args, dev):
+    paint(dev, channel_list(args.channel, dev), args.color)
+
+
+def cmd_off(args, dev):
+    paint(dev, channel_list(args.channel, dev), (0, 0, 0))
+
+
+def cmd_direct(args, dev):
+    channels = channel_list(args.channel, dev)
+    for channel in channels:
+        dev.enter_direct(channel)
+    for channel in channels:
+        count = args.leds or dev.led_count(channel)
+        dev.direct(channel, [args.color] * count)
+
+
+def cmd_pulse(args, dev):
+    animate(dev, channel_list(args.channel, dev), "breathing", args.color)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="aura", description="control ASUS AURA lighting")
+    parser.add_argument("--device", help="hidraw node (default: autodetect)")
+    parser.add_argument("--channel", default="all",
+                        help="header/channel index, or 'all' (default)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("info", help="probe the controller (read-only)")
+
+    p = sub.add_parser("effect", help="run an effect (animated ones hold the "
+                                      "terminal until Ctrl-C)")
+    p.add_argument("effect", choices=sorted(EFFECTS))
+    p.add_argument("color", nargs="?", type=parse_color, default=None)
+
+    p = sub.add_parser("static", help="solid colour")
+    p.add_argument("color", type=parse_color)
+
+    sub.add_parser("off", help="turn the lighting off")
+
+    p = sub.add_parser("direct", help="set every LED from the host")
+    p.add_argument("color", type=parse_color)
+    p.add_argument("--leds", type=int, default=0,
+                   help="LED count (default: ask the controller)")
+
+    p = sub.add_parser("pulse", help="host-driven breathing animation")
+    p.add_argument("color", nargs="?", type=parse_color, default=(0, 128, 255))
+    p.add_argument("--leds", type=int, default=0,
+                   help="LED count (default: ask the controller)")
+
+    args = parser.parse_args()
+
+    handlers = {
+        "info": cmd_info, "effect": cmd_effect, "static": cmd_static,
+        "off": cmd_off, "direct": cmd_direct, "pulse": cmd_pulse,
+    }
+    with Aura(args.device) as dev:
+        handlers[args.command](args, dev)
+
+
+if __name__ == "__main__":
+    main()
