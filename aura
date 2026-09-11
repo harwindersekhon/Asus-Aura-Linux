@@ -600,7 +600,8 @@ def cmd_spectrum(args, dev):
 
 
 def cmd_pulse(args, dev):
-    animate(dev, channel_list(args.channel, dev), "breathing", args.color)
+    animate(dev, channel_list(args.channel, dev), "breathing", args.color,
+            leds=args.leds)
 
 
 def cmd_remember(args, dev):
