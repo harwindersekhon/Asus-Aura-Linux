@@ -9,6 +9,7 @@ Zero dependencies: speaks the vendor HID protocol straight to /dev/hidraw*.
   aura static red                # solid colour
   aura static '#00ffcc'
   aura effect breathing blue     # animated; runs until Ctrl-C
+  aura effect ember              # the "ember" theme: slow drifting coals
   aura off
   aura pulse cyan
 
@@ -19,8 +20,11 @@ colour lives in volatile state - it is lost on power-off, not saved to flash.
 """
 
 import argparse
+import functools
 import glob
+import math
 import os
+import pathlib
 import random
 import re
 import select
@@ -55,8 +59,40 @@ FALLBACK_LEDS = 120
 # streamed as direct frames. ANIMATED effects run until Ctrl-C.
 STILL_EFFECTS = ("static", "off")
 ANIMATED_EFFECTS = ("breathing", "flashing", "cycle", "rainbow", "chase",
-                    "flicker")
+                    "flicker", "ember")
 EFFECTS = STILL_EFFECTS + ANIMATED_EFFECTS
+
+# Effects that are a whole look rather than one colour animated. The value is
+# the colour the look is built from; passing a colour on the command line still
+# overrides it, so `aura effect ember blue` burns cold.
+THEME_COLORS = {"ember": (255, 90, 0)}
+
+# "ember" - three drifting waves summed into a heat field, then read through a
+# blackbody-ish ramp. Spatial frequencies are whole numbers so the pattern joins
+# up on ring-shaped headers (pump heads, fans) instead of showing a seam; the
+# drift rates share no common factor, so the three layers slide past each other
+# for minutes before the picture repeats.
+#
+# Drift is phase per frame at the nominal 30 fps animate() clocks to, so these
+# work out at a 12 s trip around the strip for the slow layer, 20 s and 37 s for
+# the two above it - and stay that way whatever the strip length.
+#
+# A layer finer than two LEDs per cycle cannot be sampled and would alias into a
+# slow moire, so frame_for drops any whose frequency a short strip cannot carry
+# and shares its weight among the rest. A 12-LED fan therefore runs the 1- and
+# 3-cycle layers only.
+#           cycles across the strip, phase drift per frame, share of the field
+EMBER_LAYERS = ((1.0, 0.0028, 0.55),
+                (3.0, -0.0017, 0.30),
+                (7.0, 0.0009, 0.15))
+EMBER_GAMMA = 2.0       # >1 keeps most of the strip cool so flares stand out
+EMBER_KNEE = 0.75       # heat at which the ramp reaches the flare colour
+EMBER_BREATH = 120      # frames per cycle of the slow global brighten/cool
+EMBER_DEPTH = 0.18      # how far that breath pulls the whole strip down
+EMBER_RAMP_STEPS = 64
+EMBER_COAL = 0.22       # brightness of the coldest coal, as a share of flare
+EMBER_TIP = 0.75        # how far the hottest tip is lifted towards white
+EMBER_TIP_BIAS = 0.35   # ...weighted by how strong the channel already is
 
 COLORS = {
     "off": (0, 0, 0), "black": (0, 0, 0), "white": (255, 255, 255),
@@ -64,6 +100,99 @@ COLORS = {
     "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
     "orange": (255, 64, 0), "purple": (128, 0, 255), "pink": (255, 32, 96),
 }
+
+
+def config_path():
+    """Return the config file path.
+
+    Uses $XDG_CONFIG_HOME/aura/config if XDG_CONFIG_HOME is set, else ~/.config/aura/config.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "aura", "config")
+    return os.path.expanduser("~/.config/aura/config")
+
+
+def read_config():
+    """Parse the config file and return a dict of key-value pairs.
+
+    Reads lines of the form 'key = value'; ignores blank lines and lines starting
+    with '#'. Malformed lines are silently skipped. Returns {} if the file does not exist.
+    """
+    path = config_path()
+    config = {}
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                config[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return config
+
+
+def configured_leds(channel):
+    """Return the configured LED count for a channel, or 0 if unset.
+
+    Checks for leds.<channel> first, then falls back to a plain leds key.
+    Ignores values that are not positive integers.
+    """
+    config = read_config()
+    # Try channel-specific key first
+    key = f"leds.{channel}"
+    if key in config:
+        try:
+            count = int(config[key])
+            if count > 0:
+                return count
+        except ValueError:
+            pass
+    # Fall back to plain leds key
+    if "leds" in config:
+        try:
+            count = int(config["leds"])
+            if count > 0:
+                return count
+        except ValueError:
+            pass
+    return 0
+
+
+def write_config(key, value):
+    """Write or update a key in the config file.
+
+    Creates parent directories as needed. Updates the key in place if present,
+    otherwise appends it. Preserves existing keys and comment lines.
+    """
+    path = config_path()
+    parent = os.path.dirname(path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, mode=0o700)
+
+    # Read existing content
+    lines = []
+    found = False
+    if os.path.exists(path):
+        with open(path, "r") as fh:
+            for line in fh:
+                if line.rstrip().split("=")[0].strip() == key:
+                    lines.append(f"{key} = {value}\n")
+                    found = True
+                else:
+                    lines.append(line)
+
+    # Append if not found
+    if not found:
+        lines.append(f"{key} = {value}\n")
+
+    # Write back
+    with open(path, "w") as fh:
+        fh.writelines(lines)
 
 
 def parse_color(text):
@@ -256,7 +385,13 @@ def cmd_info(args, dev):
     if table:
         print(f"channels    {dev.channel_count()}")
         for channel in range(dev.channel_count()):
-            print(f"  channel {channel}  up to {dev.led_count(channel)} LEDs")
+            controller_count = dev.led_count(channel)
+            configured = configured_leds(channel)
+            if configured:
+                print(f"  channel {channel}  {configured} LEDs (configured: "
+                      f"{config_path()})")
+            else:
+                print(f"  channel {channel}  up to {controller_count} LEDs")
         print("config table (raw):")
         for offset in range(0, len(table), 16):
             row = table[offset:offset + 16]
@@ -274,6 +409,33 @@ def hsv_rgb(hue, value=1.0):
     table = ((1, rise, 0), (fall, 1, 0), (0, 1, rise),
              (0, fall, 1), (rise, 0, 1), (1, 0, fall))
     return tuple(int(component * value * 255) for component in table[sector])
+
+
+@functools.lru_cache(maxsize=8)
+def ember_ramp(flare, steps=EMBER_RAMP_STEPS):
+    """Heat 0..1 -> colour, as a lookup table built from the flare colour.
+
+    Cold coals sit at the bottom, the flare itself at EMBER_KNEE, a white-hot
+    tip above it. Cooling reddens rather than just dimming: the 2.2 gamma drops
+    the weaker channels faster than the dominant one, so orange fades through
+    deep red instead of through grey.
+    """
+    coal = tuple(255.0 * (c / 255.0) ** 2.2 * EMBER_COAL for c in flare)
+    # Lifting every channel equally towards white makes the hot end pale - a
+    # peach that a diffused fan ring just reads as "white". Weighting the lift
+    # by each channel's existing strength keeps the dead channels dead, so the
+    # tip climbs orange -> amber the way a real coal does instead of washing out.
+    tip = tuple(c + (255 - c) * EMBER_TIP * (c / 255.0) ** EMBER_TIP_BIAS
+                for c in flare)
+    ramp = []
+    for index in range(steps):
+        heat = index / (steps - 1.0)
+        if heat < EMBER_KNEE:
+            low, high, frac = coal, flare, heat / EMBER_KNEE
+        else:
+            low, high, frac = flare, tip, (heat - EMBER_KNEE) / (1 - EMBER_KNEE)
+        ramp.append(tuple(int(a + (b - a) * frac) for a, b in zip(low, high)))
+    return tuple(ramp)
 
 
 def frame_for(effect, color, step, leds):
@@ -297,24 +459,64 @@ def frame_for(effect, color, step, leds):
             level = max(0.0, 1.0 - distance / 8.0)
             out.append(tuple(int(c * level) for c in color))
         return out
+    if effect == "ember":
+        ramp = ember_ramp(color)
+        breath = 1.0 - EMBER_DEPTH * (0.5 + 0.5 * math.sin(
+            math.tau * step / EMBER_BREATH))
+        # Nyquist: a layer needs two LEDs per cycle. Keep the weights summing
+        # to 1 after dropping the ones that do not fit, or the field stops
+        # spanning the full ramp and the fire washes out to a flat mid-orange.
+        layers = [layer for layer in EMBER_LAYERS if layer[0] * 2 <= leds]
+        share = sum(layer[2] for layer in layers) or 1.0
+        out = []
+        for i in range(leds):
+            position = i / float(leds)
+            heat = 0.5
+            for cycles, drift, weight in layers:
+                heat += 0.5 * (weight / share) * math.sin(
+                    math.tau * (cycles * position + drift * step))
+            heat = min(1.0, max(0.0, heat)) ** EMBER_GAMMA * breath
+            out.append(ramp[int(heat * (EMBER_RAMP_STEPS - 1))])
+        return out
     if effect == "flicker":
         return [tuple(int(c * random.uniform(0.25, 1.0)) for c in color)
                 for _ in range(leds)]
     raise ValueError(effect)
 
 
-def animate(dev, channels, effect, color, fps=30):
-    counts = {c: dev.led_count(c) for c in channels}
+def pad_frame(dev, channel, colors):
+    """Pad a short frame with black out to the channel's full length.
+
+    Two things bite here. Direct mode only changes the LEDs a frame covers, so
+    a short --leds over a longer previous pattern leaves its tail lit. But the
+    tail cannot be cleared by a second write either: this controller applies a
+    frame as a unit, and a second apply on the same channel blanks whatever the
+    previous one set - paint 12 LEDs, then clear 12..119, and the 12 go out too.
+    So the padding has to travel in the same batch as the colours.
+    """
+    spare = dev.led_count(channel) - len(colors)
+    return list(colors) + [(0, 0, 0)] * max(0, spare)
+
+
+def animate(dev, channels, effect, color, fps=30, leds=0):
+    counts = {c: leds or configured_leds(c) or dev.led_count(c) for c in channels}
     for channel in channels:
         dev.enter_direct(channel)
+        # Only the opening frame is padded out to full length; after that the
+        # short frames keep re-applying and the tail stays dark on their own.
+        dev.direct(channel, pad_frame(dev, channel, [(0, 0, 0)] * counts[channel]))
     print(f"{effect} - Ctrl-C to stop")
     try:
-        step = 0
+        start = time.monotonic()
         while True:
+            # Phase comes from the clock rather than a frame count: a frame is
+            # several HID packets per channel, so a long strip renders far
+            # slower than a short one and a counter would make the same effect
+            # crawl on one rig and race on another.
+            step = (time.monotonic() - start) * fps
             for channel in channels:
                 dev.direct(channel, frame_for(effect, color, step,
                                               counts[channel]))
-            step += 1
             time.sleep(1.0 / fps)
     except KeyboardInterrupt:
         print()
@@ -322,13 +524,13 @@ def animate(dev, channels, effect, color, fps=30):
 
 def cmd_effect(args, dev):
     channels = channel_list(args.channel, dev)
-    color = args.color or (255, 255, 255)
+    color = args.color or THEME_COLORS.get(args.effect, (255, 255, 255))
     if args.effect == "off":
         paint(dev, channels, (0, 0, 0))
     elif args.effect == "static":
         paint(dev, channels, color)
     else:
-        animate(dev, channels, args.effect, color)
+        animate(dev, channels, args.effect, color, leds=args.leds)
 
 
 def cmd_static(args, dev):
@@ -344,12 +546,79 @@ def cmd_direct(args, dev):
     for channel in channels:
         dev.enter_direct(channel)
     for channel in channels:
-        count = args.leds or dev.led_count(channel)
-        dev.direct(channel, [args.color] * count)
+        count = args.leds or configured_leds(channel) or dev.led_count(channel)
+        dev.direct(channel, pad_frame(dev, channel, [args.color] * count))
+
+
+RULER_BLOCK = 4
+RULER_BANDS = ("red", "green", "blue", "yellow",
+               "magenta", "cyan", "white", "orange")
+
+
+def cmd_ruler(args, dev):
+    """Paint LEDs in blocks of four, each block a different colour.
+
+    The controller cannot tell us how many LEDs are really on a header - it
+    reports the maximum it supports. Counting the bands that actually light up
+    gives the true figure to within four, which is what --leds wants.
+    """
+    channels = channel_list(args.channel, dev)
+    for channel in channels:
+        dev.enter_direct(channel)
+    for channel in channels:
+        colors = []
+        for index in range(dev.led_count(channel)):
+            band = index // RULER_BLOCK
+            name = RULER_BANDS[band] if band < len(RULER_BANDS) else None
+            colors.append(COLORS[name] if name else (24, 24, 24))
+        dev.direct(channel, colors)
+    print(f"{RULER_BLOCK} LEDs per band, in this order:")
+    for band, name in enumerate(RULER_BANDS):
+        print(f"  {name:<8} LEDs {band * RULER_BLOCK}-"
+              f"{band * RULER_BLOCK + RULER_BLOCK - 1}")
+    print(f"  dim grey LEDs {len(RULER_BANDS) * RULER_BLOCK}+")
+    print("\nCount the bands on each device. Last full band N (0-based) means "
+          f"at least {RULER_BLOCK} x (N+1) LEDs;")
+    print("a partial band means the strip ends inside it. Pass the total to "
+          "--leds.")
+
+
+def cmd_spectrum(args, dev):
+    """Give every LED its own hue, evenly spaced around the colour wheel.
+
+    The still counterpart to `rainbow`, which spins this same spread: here the
+    colours are painted once and left, so the command exits instead of holding
+    the terminal. With 12 LEDs that is one hue every 30 degrees.
+    """
+    channels = channel_list(args.channel, dev)
+    for channel in channels:
+        dev.enter_direct(channel)
+    for channel in channels:
+        count = args.leds or configured_leds(channel) or dev.led_count(channel)
+        hues = [hsv_rgb(i / float(count)) for i in range(count)]
+        dev.direct(channel, pad_frame(dev, channel, hues))
 
 
 def cmd_pulse(args, dev):
     animate(dev, channel_list(args.channel, dev), "breathing", args.color)
+
+
+def cmd_remember(args, dev):
+    """Store the LED count persistently in the config file.
+
+    With --channel all, stores the count under the plain 'leds' key (applies to
+    all channels). With a specific channel, stores it under 'leds.<channel>'.
+    """
+    if args.leds <= 0:
+        sys.exit("--leds must be a positive integer")
+
+    if args.channel == "all":
+        key = "leds"
+    else:
+        key = f"leds.{args.channel}"
+
+    write_config(key, str(args.leds))
+    print(f"Stored {key} = {args.leds} in {config_path()}")
 
 
 def main():
@@ -366,6 +635,13 @@ def main():
                                       "terminal until Ctrl-C)")
     p.add_argument("effect", choices=sorted(EFFECTS))
     p.add_argument("color", nargs="?", type=parse_color, default=None)
+    p.add_argument("--leds", type=int, default=0,
+                   help="LEDs actually on the header. The controller reports "
+                        "its maximum, not what is plugged in, and effects that "
+                        "vary along the strip (ember, rainbow, chase) spread "
+                        "themselves over whatever count they are given - so a "
+                        "16-LED fan told 120 shows one flat slice of the "
+                        "pattern. Run 'aura ruler' to measure it.")
 
     p = sub.add_parser("static", help="solid colour")
     p.add_argument("color", type=parse_color)
@@ -377,16 +653,27 @@ def main():
     p.add_argument("--leds", type=int, default=0,
                    help="LED count (default: ask the controller)")
 
+    sub.add_parser("ruler", help="paint numbered colour bands to count LEDs")
+
+    p = sub.add_parser("spectrum", help="one fixed hue per LED (still rainbow)")
+    p.add_argument("--leds", type=int, default=0,
+                   help="LEDs actually on the header (see 'aura ruler')")
+
     p = sub.add_parser("pulse", help="host-driven breathing animation")
     p.add_argument("color", nargs="?", type=parse_color, default=(0, 128, 255))
     p.add_argument("--leds", type=int, default=0,
                    help="LED count (default: ask the controller)")
+
+    p = sub.add_parser("remember", help="store LED count persistently")
+    p.add_argument("--leds", type=int, default=0, required=True,
+                   help="LED count to remember")
 
     args = parser.parse_args()
 
     handlers = {
         "info": cmd_info, "effect": cmd_effect, "static": cmd_static,
         "off": cmd_off, "direct": cmd_direct, "pulse": cmd_pulse,
+        "ruler": cmd_ruler, "spectrum": cmd_spectrum, "remember": cmd_remember,
     }
     with Aura(args.device) as dev:
         handlers[args.command](args, dev)

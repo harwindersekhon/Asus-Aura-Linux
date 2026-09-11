@@ -72,6 +72,9 @@ aura static 0,128,255              # Solid colour by RGB
 aura static '#00ffcc'              # Solid colour by hex
 aura effect breathing cyan          # Breathing animation on all channels
 aura effect rainbow                # Cycling rainbow
+aura ruler                         # Count the LEDs actually on each header
+aura effect ember --leds 12        # "ember" theme: drifting coals
+aura effect ember '#3aa0ff'        # ...the same fire, burning cold
 aura pulse                          # Breathing blue (default) on all channels
 aura off                            # Turn off all LEDs
 aura --channel 0 static white      # Solid white on channel 0 only
@@ -88,6 +91,9 @@ aura --device /dev/hidraw5 info    # Use specific device node
 | `direct` | `<color> [--leds N]` | Set every LED to one colour via host direct mode |
 | `pulse` | `[color] [--leds N]` | Host-driven breathing animation (default blue, blocks until Ctrl-C) |
 | `off` | none | Turn off all LEDs |
+| `ruler` | none | Paint four-LED colour bands so you can count what is really on a header |
+| `spectrum` | `[--leds N]` | One fixed hue per LED, evenly spaced around the colour wheel (instant) |
+| `remember` | `--leds N` | Store the LED count persistently so effects scale correctly by default |
 
 ### Global options
 
@@ -100,7 +106,51 @@ on what the controller reports; run `aura info` to see the count.
 
 ### Per-command options
 
-`--leds N` : LED count for `direct` and `pulse` (default: read from controller)
+`--leds N` : LED count for `effect`, `direct` and `pulse` (default: read from controller)
+
+## How many LEDs? (`--leds`)
+
+**The controller reports its maximum capacity, not what you have plugged in.**
+`aura info` says 120 LEDs per channel on every channel because 120 is the most
+this controller will drive — a 12-LED fan on that header still reports 120.
+
+Effects that vary *along* the strip — `ember`, `rainbow`, `chase` — spread
+themselves across whatever count they are given. Told 120 when only 12 exist,
+they render the pattern over 120 positions and the fan shows the first 10% of
+it: a nearly flat slice that drifts in brightness. It looks like a solid colour.
+
+Run `aura ruler` to measure. It paints LEDs in blocks of four —
+red, green, blue, yellow, magenta, cyan, white, orange, then dim grey past 32 —
+so counting the bands that light up gives the real figure to within four. Fans
+showing red/green/blue and nothing else have 12 LEDs:
+
+```bash
+aura ruler
+aura effect ember --leds 12
+```
+
+### Making the LED count persistent
+
+Once you know the real count, you can store it so effects use it by default:
+
+```bash
+aura remember --leds 12
+aura info
+aura effect ember  # now uses 12 LEDs without needing --leds
+```
+
+The count is stored in `~/.config/aura/config` (or `$XDG_CONFIG_HOME/aura/config`).
+It resolves in this order for any command that needs it:
+
+1. Explicit `--leds` flag on the command line (highest priority)
+2. Configured value from `aura remember` for that channel or globally
+3. Controller's reported maximum (lowest priority)
+
+You can store counts per-channel: `aura --channel 0 remember --leds 16` stores the
+count for channel 0 only. `aura remember --leds 12` (without `--channel`) stores a
+global default that applies to all channels.
+
+`static`, `pulse` and `off` paint every LED the same colour, so they do not care about the count.
 
 ## Colour formats
 
@@ -116,6 +166,8 @@ Components must be in the range 0–255; out-of-range values are rejected rather
 ### Static (instant)
 - `static` : Solid colour
 - `off` : All LEDs off
+- `spectrum` : One fixed hue per LED, evenly spaced around the colour wheel (the still
+  counterpart to `rainbow`; with 12 LEDs that is one hue every 30 degrees)
 
 ### Animated (run until Ctrl-C)
 - `breathing` : Fade in and out smoothly
@@ -124,10 +176,40 @@ Components must be in the range 0–255; out-of-range values are rejected rather
 - `rainbow` : Rainbow gradient across LEDs
 - `chase` : Colour chases along the strip
 - `flicker` : Random brightness flicker
+- `ember` : Drifting coals (see **Themes**)
+
+### Themes
+
+A theme is an effect that is a whole look rather than one colour animated, so it
+brings its own palette and needs no colour argument.
+
+- `ember` : A bed of coals. Three waves of different spatial frequency drift
+  along the strip at speeds that share no common factor, summing into a heat
+  field that is read through a blackbody ramp — `#380500` coal at the cold end,
+  orange at the middle, an `#ffaf00` amber tip where two waves crest together.
+  The hot end climbs towards amber rather than towards white: lifting every
+  channel equally produces a pale peach that a diffused fan ring simply reads as
+  white, which is not what a coal looks like. The
+  layers take minutes to line up again, so the fire never visibly loops, and a
+  slow global breath rides on top.
+
+  Passing a colour rebuilds the ramp around it instead of overriding the look:
+  `aura effect ember '#3aa0ff'` gives the same drifting fire in blue. The
+  spatial frequencies are whole numbers, so the pattern joins up seamlessly on
+  ring-shaped headers (pump heads, fans) as well as along a strip.
+
+  **Pass `--leds`** with the real LED count (see above) or the fan will show one
+  flat slice of the fire rather than the whole of it. Short strips cannot sample
+  the finer layers — a layer needs two LEDs per cycle — so `ember` drops the ones
+  that would alias and shares their weight among the rest. A 12-LED fan runs the
+  1- and 3-cycle layers: one flare travelling around the ring with three smaller
+  coals turning under it.
 
 Animated effects target 30 FPS on the host. The real rate is lower on strips with
 many LEDs, since each frame is several HID packets and the controller needs a
-short gap between writes.
+short gap between writes — 3 channels of 120 LEDs measures about 13 FPS. Animation
+phase is taken from the clock rather than a frame counter, so an effect runs at
+the same speed regardless; a slow strip drops frames instead of slowing down.
 
 ## Limitations
 
@@ -155,6 +237,11 @@ These findings are the result of extensive hardware testing and are useful for a
    - Byte 1: Opcode (0x40 for direct, 0x35 for effect, etc.)
    - Direct frames: max 20 LEDs per packet (60 payload bytes), start-LED at byte 0x03, count at byte 0x04
    - Writes sent back-to-back are dropped; a small delay (1–4 ms) between packets is required
+
+4. **A second apply blanks the first**: The controller applies a direct frame as a unit. Sending
+   LEDs 0–11 with the apply flag and then sending a second batch to clear LEDs 12–119 switches OFF
+   the 12 that were just set. A short frame must carry its black tail in the SAME batch — which is
+   what the `pad_frame` function does.
 
 ## Troubleshooting
 
